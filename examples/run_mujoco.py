@@ -33,6 +33,7 @@ from src.estimator_ekf import OrientationEKF
 from src.controller_pmp import PontryaginController
 from src.controller_lqg import LQGController
 from src.controller_mpc import MPCController
+from src.trajectory import WaypointTrajectory, make_trajectory
 
 
 # =====================================================================
@@ -237,6 +238,50 @@ def build_reference_state(
     return x_ref
 
 
+def reference_state_from_trajectory(
+    trajectory: WaypointTrajectory,
+    t: float,
+    height: float,
+) -> np.ndarray:
+    """Compose the 12-dim reference from a waypoint trajectory at time t.
+
+    The trajectory dictates p, v, yaw and yaw_rate; the z component and
+    z-velocity are anchored to the controller's nominal hip height so that
+    waypoints that omit the z-channel still produce a stable upright pose.
+    """
+    x_ref = trajectory.reference_state(t)
+    x_ref[2] = height
+    x_ref[5] = 0.0
+    return x_ref
+
+
+def compute_tracking_metrics(state: np.ndarray, state_ref: np.ndarray,
+                             control: np.ndarray) -> dict:
+    """Per-axis error statistics between executed and reference trajectories.
+
+    Yaw is wrapped into (-pi, pi] before taking the RMSE so that wrap-around
+    on closed paths does not contaminate the metric.
+    """
+    pos_err = state[:, 0:3] - state_ref[:, 0:3]
+    vel_err = state[:, 3:6] - state_ref[:, 3:6]
+    yaw_err = np.arctan2(
+        np.sin(state[:, 8] - state_ref[:, 8]),
+        np.cos(state[:, 8] - state_ref[:, 8]),
+    )
+    return {
+        "pos_x_rmse":  float(np.sqrt(np.mean(pos_err[:, 0] ** 2))),
+        "pos_y_rmse":  float(np.sqrt(np.mean(pos_err[:, 1] ** 2))),
+        "pos_z_rmse":  float(np.sqrt(np.mean(pos_err[:, 2] ** 2))),
+        "pos_xy_rmse": float(np.sqrt(np.mean(np.sum(pos_err[:, :2] ** 2, axis=1)))),
+        "pos_xy_max":  float(np.max(np.linalg.norm(pos_err[:, :2], axis=1))),
+        "vel_rmse":    float(np.sqrt(np.mean(np.sum(vel_err ** 2, axis=1)))),
+        "yaw_rmse":    float(np.sqrt(np.mean(yaw_err ** 2))),
+        "yaw_max":     float(np.max(np.abs(yaw_err))),
+        "u_mean":      float(np.mean(np.linalg.norm(control, axis=1))),
+        "u_max":       float(np.max(np.linalg.norm(control, axis=1))),
+    }
+
+
 # =====================================================================
 # Controllers
 # =====================================================================
@@ -355,6 +400,142 @@ def save_single_run_plot(result, controller_name, robot_name, disturbance_type, 
     print(f"\n  Plot saved: {path}")
 
 
+def save_trajectory_run_plot(result, controller_name, robot_name, trajectory_name):
+    """Plot reference vs executed trajectory for a single controller."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs("results", exist_ok=True)
+
+    log_t = result["time"]
+    log_x = result["state"]
+    log_xref = result["state_ref"]
+    log_u = result["control"]
+
+    fig = plt.figure(figsize=(14, 10))
+    fig.suptitle(
+        f"{controller_name.upper()} — {robot_name} — trajectory: {trajectory_name}",
+        fontsize=14, fontweight="bold",
+    )
+
+    ax_xy = plt.subplot2grid((4, 2), (0, 0), rowspan=2)
+    ax_xy.plot(log_xref[:, 0], log_xref[:, 1], "k--", lw=1.5, label="reference")
+    ax_xy.plot(log_x[:, 0], log_x[:, 1], "tab:blue", lw=1.5, label="actual")
+    ax_xy.scatter([log_xref[0, 0]], [log_xref[0, 1]], c="green", s=40, zorder=5,
+                  label="start")
+    ax_xy.scatter([log_xref[-1, 0]], [log_xref[-1, 1]], c="red", s=40, zorder=5,
+                  label="end")
+    ax_xy.set_xlabel("x [m]")
+    ax_xy.set_ylabel("y [m]")
+    ax_xy.set_title("XY path tracking")
+    ax_xy.set_aspect("equal", adjustable="datalim")
+    ax_xy.grid(True, alpha=0.3)
+    ax_xy.legend(fontsize=8)
+
+    ax_pos = plt.subplot2grid((4, 2), (0, 1))
+    for i, lbl in enumerate(["x", "y"]):
+        ax_pos.plot(log_t, log_xref[:, i], "--", lw=1.0, label=f"ref {lbl}")
+        ax_pos.plot(log_t, log_x[:, i], lw=1.3, label=f"act {lbl}")
+    ax_pos.set_ylabel("Position [m]")
+    ax_pos.legend(ncol=2, fontsize=7)
+    ax_pos.grid(True, alpha=0.3)
+
+    ax_vel = plt.subplot2grid((4, 2), (1, 1))
+    for i, lbl in enumerate(["x", "y"]):
+        ax_vel.plot(log_t, log_xref[:, 3 + i], "--", lw=1.0, label=f"ref v{lbl}")
+        ax_vel.plot(log_t, log_x[:, 3 + i], lw=1.3, label=f"act v{lbl}")
+    ax_vel.set_ylabel("Velocity [m/s]")
+    ax_vel.legend(ncol=2, fontsize=7)
+    ax_vel.grid(True, alpha=0.3)
+
+    ax_yaw = plt.subplot2grid((4, 2), (2, 0), colspan=2)
+    ax_yaw.plot(log_t, np.degrees(log_xref[:, 8]), "k--", lw=1.0, label="ref yaw")
+    ax_yaw.plot(log_t, np.degrees(log_x[:, 8]), "tab:purple", lw=1.3, label="act yaw")
+    ax_yaw.set_ylabel("Yaw [deg]")
+    ax_yaw.legend(fontsize=8)
+    ax_yaw.grid(True, alpha=0.3)
+
+    ax_u = plt.subplot2grid((4, 2), (3, 0), colspan=2)
+    ax_u.plot(log_t, np.linalg.norm(log_u, axis=1), color="tab:red", lw=1.2)
+    ax_u.set_ylabel("||GRFs|| [N]")
+    ax_u.set_xlabel("Time [s]")
+    ax_u.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = f"results/trajectory_{controller_name}_{robot_name}_{trajectory_name}.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"\n  Trajectory plot saved: {path}")
+
+
+def save_trajectory_comparison_plot(results, robot_name, trajectory_name):
+    """Overlay reference vs each controller's executed XY path and error curves."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs("results", exist_ok=True)
+    colors = {"pmp": "#e74c3c", "lqg": "#2ecc71", "mpc": "#3498db"}
+
+    fig = plt.figure(figsize=(15, 10))
+    fig.suptitle(
+        f"Controller comparison — {robot_name} — trajectory: {trajectory_name}",
+        fontsize=14, fontweight="bold",
+    )
+
+    ax_xy = plt.subplot2grid((3, 2), (0, 0), rowspan=2)
+    first = next(iter(results.values()))
+    ref = first["state_ref"]
+    ax_xy.plot(ref[:, 0], ref[:, 1], "k--", lw=2.0, label="reference")
+    for name, data in results.items():
+        ax_xy.plot(data["state"][:, 0], data["state"][:, 1],
+                   color=colors[name], lw=1.5, label=name.upper())
+    ax_xy.set_xlabel("x [m]")
+    ax_xy.set_ylabel("y [m]")
+    ax_xy.set_title("XY path tracking")
+    ax_xy.set_aspect("equal", adjustable="datalim")
+    ax_xy.grid(True, alpha=0.3)
+    ax_xy.legend(fontsize=9)
+
+    ax_xyerr = plt.subplot2grid((3, 2), (0, 1))
+    for name, data in results.items():
+        e = data["state"][:, :2] - data["state_ref"][:, :2]
+        ax_xyerr.plot(data["time"], np.linalg.norm(e, axis=1),
+                      color=colors[name], lw=1.3, label=name.upper())
+    ax_xyerr.set_ylabel("XY error [m]")
+    ax_xyerr.legend(fontsize=8)
+    ax_xyerr.grid(True, alpha=0.3)
+
+    ax_yawerr = plt.subplot2grid((3, 2), (1, 1))
+    for name, data in results.items():
+        e = np.arctan2(
+            np.sin(data["state"][:, 8] - data["state_ref"][:, 8]),
+            np.cos(data["state"][:, 8] - data["state_ref"][:, 8]),
+        )
+        ax_yawerr.plot(data["time"], np.degrees(e),
+                       color=colors[name], lw=1.3, label=name.upper())
+    ax_yawerr.set_ylabel("Yaw error [deg]")
+    ax_yawerr.set_xlabel("Time [s]")
+    ax_yawerr.legend(fontsize=8)
+    ax_yawerr.grid(True, alpha=0.3)
+
+    ax_u = plt.subplot2grid((3, 2), (2, 0), colspan=2)
+    for name, data in results.items():
+        ax_u.plot(data["time"], np.linalg.norm(data["control"], axis=1),
+                  color=colors[name], lw=1.2, label=name.upper())
+    ax_u.set_ylabel("||GRFs|| [N]")
+    ax_u.set_xlabel("Time [s]")
+    ax_u.legend(fontsize=8)
+    ax_u.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = f"results/trajectory_comparison_{robot_name}_{trajectory_name}.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"\n  Trajectory comparison plot saved: {path}")
+
+
 def save_comparison_plot(results, robot_name, disturbance_type):
     import matplotlib
     matplotlib.use("Agg")
@@ -415,11 +596,14 @@ def run(
     duration: float = 10.0,
     disturbance_type: str = "impulse",
     save_log: bool = True,
+    trajectory: WaypointTrajectory = None,
+    trajectory_name: str = None,
 ):
     print(f"\n{'=' * 60}")
     print(f"  Controller:   {controller_name.upper()}")
     print(f"  Robot:        {robot_name}")
     print(f"  Teleop:       {teleop_enabled}")
+    print(f"  Trajectory:   {trajectory_name or 'none'}")
     print(f"  Duration:     {duration}s")
     print(f"  Disturbance:  {disturbance_type}")
     print(f"{'=' * 60}\n")
@@ -463,6 +647,7 @@ def run(
     n_steps = int(duration / sim_dt)
 
     log_t, log_x, log_u, log_err, log_dist = [], [], [], [], []
+    log_xref = []
     current_grfs = u_ref.copy()
 
     print(f"  Sim dt: {sim_dt}s, Ctrl rate: {1 / ctrl_dt:.0f} Hz, Total steps: {n_steps}")
@@ -476,17 +661,25 @@ def run(
             contact = get_contacts(env)
             r_feet = get_feet_world(env)
 
-            cmd_vx = teleop.vx if teleop_enabled else 0.0
-            cmd_vy = teleop.vy if teleop_enabled else 0.0
-            cmd_wz = teleop.wz if teleop_enabled else 0.0
+            if trajectory is not None:
+                x_ref = reference_state_from_trajectory(
+                    trajectory, t, ROBOT_HIP_HEIGHT
+                )
+                cmd_vx = float(x_ref[3])
+                cmd_vy = float(x_ref[4])
+                cmd_wz = float(x_ref[11])
+            else:
+                cmd_vx = teleop.vx if teleop_enabled else 0.0
+                cmd_vy = teleop.vy if teleop_enabled else 0.0
+                cmd_wz = teleop.wz if teleop_enabled else 0.0
 
-            x_ref = build_reference_state(
-                dyn,
-                height=ROBOT_HIP_HEIGHT,
-                vx=cmd_vx,
-                vy=cmd_vy,
-                wz=cmd_wz,
-            )
+                x_ref = build_reference_state(
+                    dyn,
+                    height=ROBOT_HIP_HEIGHT,
+                    vx=cmd_vx,
+                    vy=cmd_vy,
+                    wz=cmd_wz,
+                )
 
             try:
                 if hasattr(env, "target_base_vel"):
@@ -555,6 +748,7 @@ def run(
             log_t.append(t)
             log_x.append(x.copy())
             log_u.append(current_grfs.copy())
+            log_xref.append(x_ref.copy())
             log_err.append(np.linalg.norm(x[:6] - x_ref[:6]))
             log_dist.append(np.linalg.norm(dist))
 
@@ -585,25 +779,39 @@ def run(
     log_t = np.array(log_t) if len(log_t) > 0 else np.zeros(1)
     log_x = np.array(log_x) if len(log_x) > 0 else np.zeros((1, 12))
     log_u = np.array(log_u) if len(log_u) > 0 else np.zeros((1, 12))
+    log_xref = np.array(log_xref) if len(log_xref) > 0 else np.zeros((1, 12))
     log_err = np.array(log_err) if len(log_err) > 0 else np.zeros(1)
     log_dist = np.array(log_dist) if len(log_dist) > 0 else np.zeros(1)
 
     result = {
         "time": log_t,
         "state": log_x,
+        "state_ref": log_xref,
         "control": log_u,
         "error": log_err,
         "disturbance": log_dist,
+        "trajectory_name": trajectory_name,
     }
 
     if save_log and len(log_t) > 1:
-        x_ref_nominal = build_reference_state(dyn, height=ROBOT_HIP_HEIGHT, vx=0.0, vy=0.0, wz=0.0)
-        save_single_run_plot(result, controller_name, robot_name, disturbance_type, x_ref_nominal)
+        if trajectory is not None:
+            save_trajectory_run_plot(result, controller_name, robot_name, trajectory_name)
+        else:
+            x_ref_nominal = build_reference_state(dyn, height=ROBOT_HIP_HEIGHT, vx=0.0, vy=0.0, wz=0.0)
+            save_single_run_plot(result, controller_name, robot_name, disturbance_type, x_ref_nominal)
 
+    metrics = compute_tracking_metrics(log_x, log_xref, log_u)
+    result["metrics"] = metrics
     print(f"\n  --- {controller_name.upper()} Summary ---")
-    print(f"  Position/velocity RMSE: {np.sqrt(np.mean(log_err**2)):.4f}")
-    print(f"  Max error: {np.max(log_err):.4f}")
-    print(f"  Mean GRF norm: {np.mean(np.linalg.norm(log_u, axis=1)):.1f} N")
+    if trajectory is not None:
+        print(f"  Position RMSE (xy):   {metrics['pos_xy_rmse']:.4f} m")
+        print(f"  Position RMSE (z):    {metrics['pos_z_rmse']:.4f} m")
+        print(f"  Yaw RMSE:             {np.degrees(metrics['yaw_rmse']):.2f} deg")
+        print(f"  Max XY deviation:     {metrics['pos_xy_max']:.4f} m")
+        print(f"  Velocity RMSE:        {metrics['vel_rmse']:.4f} m/s")
+    print(f"  Pose/vel RMSE (||e||): {np.sqrt(np.mean(log_err**2)):.4f}")
+    print(f"  Max error:             {np.max(log_err):.4f}")
+    print(f"  Mean GRF norm:         {np.mean(np.linalg.norm(log_u, axis=1)):.1f} N")
 
     return result
 
@@ -616,6 +824,8 @@ def run_comparison(
     duration: float,
     disturbance_type: str,
     robot_name: str,
+    trajectory: WaypointTrajectory = None,
+    trajectory_name: str = None,
 ):
     results = {}
     for name in ["pmp", "lqg", "mpc"]:
@@ -627,7 +837,41 @@ def run_comparison(
             duration=duration,
             disturbance_type=disturbance_type,
             save_log=False,
+            trajectory=trajectory,
+            trajectory_name=trajectory_name,
         )
+
+    if trajectory is not None:
+        save_trajectory_comparison_plot(results, robot_name, trajectory_name)
+        os.makedirs("results", exist_ok=True)
+        csv_path = f"results/trajectory_metrics_{robot_name}_{trajectory_name}.csv"
+        with open(csv_path, "w") as f:
+            f.write("controller,pos_xy_rmse,pos_xy_max,pos_z_rmse,"
+                    "vel_rmse,yaw_rmse_deg,u_mean,u_max\n")
+            for name, data in results.items():
+                m = data["metrics"]
+                f.write(
+                    f"{name},{m['pos_xy_rmse']:.6f},{m['pos_xy_max']:.6f},"
+                    f"{m['pos_z_rmse']:.6f},{m['vel_rmse']:.6f},"
+                    f"{np.degrees(m['yaw_rmse']):.4f},"
+                    f"{m['u_mean']:.4f},{m['u_max']:.4f}\n"
+                )
+        print(f"\n{'=' * 70}")
+        print(f"  TRAJECTORY COMPARISON ({trajectory_name})")
+        print(f"{'=' * 70}")
+        print(f"  {'Controller':<10} {'XY RMSE':>10} {'XY max':>10} "
+              f"{'Yaw RMSE':>11} {'Vel RMSE':>11} {'Mean ||u||':>12}")
+        for name, data in results.items():
+            m = data["metrics"]
+            print(
+                f"  {name.upper():<10} "
+                f"{m['pos_xy_rmse']:>10.4f} {m['pos_xy_max']:>10.4f} "
+                f"{np.degrees(m['yaw_rmse']):>10.2f}° "
+                f"{m['vel_rmse']:>11.4f} {m['u_mean']:>12.1f}"
+            )
+        print(f"{'=' * 70}")
+        print(f"  Metrics CSV saved: {csv_path}")
+        return
 
     save_comparison_plot(results, robot_name, disturbance_type)
 
@@ -669,6 +913,12 @@ if __name__ == "__main__":
         choices=["impulse", "persistent", "none"],
     )
     parser.add_argument(
+        "--trajectory",
+        default="none",
+        choices=["none", "static", "line", "square", "circle", "figure8"],
+        help="Waypoint-based reference trajectory. Disables teleop when set.",
+    )
+    parser.add_argument(
         "--no-render",
         action="store_true",
         help="Run headless without viewer",
@@ -677,22 +927,38 @@ if __name__ == "__main__":
 
     do_render = not args.no_render
 
-    if args.controller == "all":
+    trajectory = None
+    trajectory_name = None
+    if args.trajectory != "none":
+        trajectory = make_trajectory(
+            args.trajectory,
+            height=ROBOT_HIP_HEIGHT,
+            duration=args.duration,
+        )
+        trajectory_name = args.trajectory
         if args.teleop:
+            print("Teleop is ignored when --trajectory is set.")
+
+    if args.controller == "all":
+        if args.teleop and trajectory is None:
             print("Teleop is ignored in comparison mode; running fixed references only.")
         run_comparison(
             render=do_render,
             duration=args.duration,
             disturbance_type=args.disturbance,
             robot_name=args.robot_name,
+            trajectory=trajectory,
+            trajectory_name=trajectory_name,
         )
     else:
         run(
             controller_name=args.controller,
             robot_name=args.robot_name,
-            teleop_enabled=args.teleop,
+            teleop_enabled=args.teleop and trajectory is None,
             render=do_render,
             duration=args.duration,
             disturbance_type=args.disturbance,
             save_log=True,
+            trajectory=trajectory,
+            trajectory_name=trajectory_name,
         )

@@ -143,11 +143,13 @@ quadruped-optimal-control/
 │   ├── controller_pmp.py    # Pontryagin-based controller
 │   ├── controller_lqg.py    # LQG controller
 │   ├── controller_mpc.py    # MPC controller with force constraints
+│   ├── trajectory.py        # Waypoint-based reference trajectory generator
 ├── examples/
-│   └── run_mujoco.py        # Main MuJoCo runner with rendering and teleop
+│   └── run_mujoco.py        # Main MuJoCo runner (rendering, teleop, trajectories)
 ├── tests/
-│   └── test_all.py
-├── results/                 # Generated plots
+│   ├── test_all.py
+│   └── test_trajectory_tracking.py   # MuJoCo-free benchmark on the SRB model
+├── results/                 # Generated plots and CSV metrics
 └── requirements.txt
 ```
 
@@ -247,6 +249,7 @@ Arguments:
 * `--robot-name <name>`
 * `--duration <seconds>`
 * `--disturbance {impulse,persistent,none}`
+* `--trajectory {none,static,line,square,circle,figure8}`
 * `--teleop`
 * `--no-render`
 
@@ -299,6 +302,109 @@ python examples/run_mujoco.py --controller all --robot-name mini_cheetah --durat
 ```bash
 python examples/run_mujoco.py --controller lqg --robot-name aliengo --teleop
 ```
+
+## Waypoint-based trajectory tracking
+
+`src/trajectory.py` generates smooth reference trajectories from sparse
+waypoints. Each waypoint is `(t, x, y, z, yaw)`; position and yaw are
+interpolated with cubic splines (clamped boundary conditions, zero
+velocity at the endpoints), and linear / angular velocities come from the
+analytic spline derivatives, so the controllers receive a dynamically
+consistent 12-dim reference `[p, v, rpy, ω]` at every step.
+
+Predefined trajectories accessible through `--trajectory <name>`:
+
+| name      | description                                |
+| --------- | ------------------------------------------ |
+| `static`  | hold the standing pose (sanity check)      |
+| `line`    | forward translation along +x               |
+| `square`  | closed square in x-y, yaw locked to 0      |
+| `circle`  | closed circle, yaw locked to 0             |
+| `figure8` | lemniscate, yaw locked to 0                |
+
+### Run a single controller on a trajectory
+
+```bash
+python examples/run_mujoco.py --controller mpc --trajectory circle --duration 12 --no-render
+```
+
+### Run all three controllers and produce the comparison overlay
+
+```bash
+python examples/run_mujoco.py --controller all --trajectory figure8 --duration 12 --no-render
+```
+
+For each run the script writes:
+
+```text
+results/trajectory_<controller>_<robot>_<traj>.png        # single run
+results/trajectory_comparison_<robot>_<traj>.png          # --controller all
+results/trajectory_metrics_<robot>_<traj>.csv             # --controller all
+```
+
+### MuJoCo-free benchmark
+
+For a deterministic comparison of the three controllers on the *exact*
+linearised SRB plant they are built on, run:
+
+```bash
+python tests/test_trajectory_tracking.py --trajectory all --duration 12
+```
+
+This produces, in `results/`:
+
+```text
+trajectory_lin_<traj>.png
+trajectory_metrics_lin_<traj>.csv
+```
+
+### Trajectory-tracking results (SRB-linear benchmark)
+
+Run with `duration=12 s`, `dt=0.01 s` on a matched-model plant. Numbers
+are best-case for absolute magnitudes, but the *relative* ordering
+between controllers is what matters.
+
+| Trajectory | Controller | XY RMSE [m] | XY max [m] | Vel RMSE [m/s] | Mean ‖u‖ [N] |
+| ---------- | ---------- | ----------- | ---------- | -------------- | ------------ |
+| line       | PMP        | 0.0004      | 0.0008     | 0.0004         | 44.1         |
+| line       | LQG        | 0.0015      | 0.0033     | 0.0178         | 44.5         |
+| line       | MPC        | 0.0082      | 0.0132     | 0.0025         | 44.1         |
+| square     | PMP        | 0.0024      | 0.0037     | 0.0025         | 44.2         |
+| square     | LQG        | 0.0028      | 0.0052     | 0.0180         | 44.5         |
+| square     | MPC        | 0.0168      | 0.0210     | 0.0112         | 44.2         |
+| circle     | PMP        | 0.0022      | 0.0068     | 0.0049         | 44.2         |
+| circle     | LQG        | 0.0029      | 0.0071     | 0.0186         | 44.5         |
+| circle     | MPC        | 0.0186      | 0.0222     | 0.0120         | 44.2         |
+| figure8    | PMP        | 0.0036      | 0.0130     | 0.0135         | 44.4         |
+| figure8    | LQG        | 0.0040      | 0.0126     | 0.0221         | 44.7         |
+| figure8    | MPC        | 0.0170      | 0.0280     | 0.0203         | 44.3         |
+
+Discussion:
+
+- **PMP** (LQR via the converged backward-sweep gain) gives the lowest
+  position RMSE on every path. With perfect state and a matched plant,
+  unconstrained linear feedback dominates.
+- **LQG** is within a factor of 2 of PMP on position but adds a
+  velocity-tracking penalty because its Kalman filter integrates
+  measurement noise (we add 5 mm / 2 cm·s⁻¹ / 0.5° σ on the
+  measurement vector each step).
+- **MPC** has slightly larger steady-state error because its receding
+  horizon assumes the *current* `x_ref` is constant for the next N
+  steps; on time-varying references this introduces a small lag. The
+  upside, not visible in the matched-model bench, is robustness:
+  MPC is the only controller that respects friction-cone and
+  per-leg `f_z` bounds, so it dominates as soon as constraints bite
+  (slip, low μ, force saturation, contact loss).
+- All three controllers operate near gravity-compensation effort
+  (`mass·g = 88 N` total ≈ 44 N in 4-leg L2 norm), confirming that the
+  trajectories are tracked through the SRB linearisation rather than
+  by force-limit saturation.
+
+The same trajectories driven through MuJoCo with
+`examples/run_mujoco.py` exercise the full contact and leg dynamics.
+Per the *Important Scope Note* above, this stays at the body level
+(no gait planner / swing-leg synthesis), so MuJoCo runs primarily
+demonstrate stabilisation quality at the commanded reference.
 
 ## Interpretation of Results
 
